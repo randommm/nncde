@@ -191,8 +191,8 @@ class NNCDE(BaseEstimator):
 
             inputv_val = inputv_train[index_val]
             target_val = target_train[index_val]
-            inputv_val = np.ascontiguousarray(inputv_train)
-            target_val = np.ascontiguousarray(target_train)
+            inputv_val = np.ascontiguousarray(inputv_val)
+            target_val = np.ascontiguousarray(target_val)
 
             inputv_train = inputv_train[index_train]
             target_train = target_train[index_train]
