@@ -203,9 +203,10 @@ class NNCDE(BaseEstimator):
             es_tries = 0
             range_epoch = itertools.count() # infty iterator
 
+            batch_test_size = min(self.batch_test_size,
+                                  inputv_val.shape[0])
 
-        batch_max_size = min(self.batch_max_size, x_train.shape[0])
-        batch_test_size = min(self.batch_test_size, x_train.shape[0])
+        batch_max_size = min(self.batch_max_size, inputv_train.shape[0])
 
         start_time = time.process_time()
 
@@ -527,6 +528,7 @@ class NNCDE(BaseEstimator):
                     fc = self.__getattr__("fc_" + str(i))
                     fcn = self.__getattr__("fc_n_" + str(i))
                     x = fcn(F.relu(fc(x)))
+                    #x = (F.relu(fc(x)))
                     self.m(x)
                 x = self.fc_last(x)
                 x = F.sigmoid(x / 10) * 2 * self.np_sqrt2 - self.np_sqrt2
@@ -565,8 +567,14 @@ class NNCDE(BaseEstimator):
             self.neural_net.load_state_dict(self.neural_net_params)
             del(self.neural_net_params)
             if self.gpu:
-                self.move_to_gpu()
-
+                if torch.cuda.is_available():
+                    self.move_to_gpu()
+                else:
+                    self.gpu = False
+                    print("Warning: GPU was used to train this model, "
+                          "but is not currently available and will "
+                          "be disabled "
+                          "(renable with method move_to_gpu)")
         #Recreate phi_grid
         if "y_grid" in d.keys():
             del(self.y_grid)
