@@ -97,17 +97,17 @@ class NNCDE(BaseEstimator):
 
                  es = True,
                  es_validation_set = 0.1,
-                 es_give_up_after_nepochs = 20,
+                 es_give_up_after_nepochs = 50,
                  es_splitter_random_state = 0,
 
                  nepoch=200,
 
-                 batch_initial=400,
+                 batch_initial=20,
                  batch_step_multiplier=1.1,
                  batch_step_epoch_expon=1.1,
-                 batch_max_size=500,
+                 batch_max_size=600,
 
-                 grid_size=10000,
+                 grid_size=20000,
                  batch_test_size=2000,
                  gpu=True,
                  verbose=1,
@@ -210,10 +210,10 @@ class NNCDE(BaseEstimator):
 
         start_time = time.process_time()
 
-        optimizer = optim.Adam(self.neural_net.parameters())
-        self.nn_weights_loss_penal = 100
+        optimizer = optim.Adamax(self.neural_net.parameters(),
+                                 lr=0.004)
+        es_penal_tries = 0
         for _ in range_epoch:
-            self.nn_weights_loss_penal /= 2.0
             batch_size = int(min(batch_max_size,
                 self.batch_initial +
                 self.batch_step_multiplier *
@@ -242,14 +242,37 @@ class NNCDE(BaseEstimator):
                               "so far.")
                 else:
                     es_tries += 1
-                if es_tries >= self.es_give_up_after_nepochs:
+
+                if (es_tries == self.es_give_up_after_nepochs // 3 or
+                    es_tries == self.es_give_up_after_nepochs // 3 * 2):
+                    if self.verbose >= 2:
+                        print("Decreasing learning rate by half.")
+                    optimizer.param_groups[0]['lr'] *= 0.5
+                    self.neural_net.load_state_dict(best_state_dict)
+                elif es_tries >= self.es_give_up_after_nepochs:
+                    """
+                    if es_penal_tries <= 20:
+                        self.nn_weights_loss_penal += 0.05
+                        es_penal_tries += 1
+                        es_tries = 0
+                        if self.verbose >= 1:
+                            print("Validation loss did not improve after",
+                                  self.es_give_up_after_nepochs, "tries.",
+                                  "Increasing weight penalty")
+
+                    else:
+                    """
                     self.neural_net.load_state_dict(best_state_dict)
                     if self.verbose >= 1:
                         print("Validation loss did not improve after",
-                              self.es_give_up_after_nepochs, "tries.")
+                              self.es_give_up_after_nepochs, "tries.",
+                              "Stopping")
                     break
 
             self.epoch_count += 1
+            #optimizer.param_groups[0]['weight_decay'] *= 0.9
+            #if self.epoch_count >= 200:
+            #    optimizer.param_groups[0]['weight_decay'] = 0
 
         elapsed_time = time.process_time() - start_time
         if self.verbose >= 1:
@@ -286,9 +309,6 @@ class NNCDE(BaseEstimator):
 
                 optimizer.zero_grad()
                 output = self.neural_net(inputv_this)
-
-                # Main loss
-                #loss = criterion(output, target_this)
 
                 self._create_phi_grid()
                 output_grid = Variable.mm(output, self.phi_grid)
@@ -385,45 +405,36 @@ class NNCDE(BaseEstimator):
                     target_next = target_next.cuda(async=True)
 
             if i != 0:
+                #output = self.neural_net(inputv_this)
+
+                #loss1 = -2 * (output * target_this).sum(1)
+                #loss1 = loss1.mean()
+
+                #self._create_phi_grid()
+
+                #loss2 = Variable.mm(output, self.phi_grid)**2
+                #loss2 = loss2.mean()
+
+                #loss = loss1 + loss2
+                #----------
                 output = self.neural_net(inputv_this)
 
-                loss1 = -2 * (output * target_this).sum(1)
+                self._create_phi_grid()
+                output_grid = Variable.mm(output, self.phi_grid)
+                output_grid = F.softplus(output_grid)
+
+                normalizing = output_grid.mean(1)
+
+                loss1 = F.softplus((output * target_this).sum(1))
+                loss1 = -2 * loss1 / normalizing
                 loss1 = loss1.mean()
 
-                #from scipy.integrate import quad
-                #np_out = output.data.cpu().numpy()
-                #def integrate_func(y):
-                    #return (np_out_row *
-                    #fourierseries(y, self.ncomponents, True)).sum()**2
-                #loss2 = 0
-                #for np_out_row in np_out:
-                    #loss2 += quad(integrate_func, 0, 1, limit=1000)[0]
-                #loss2 = loss2 / np_out.shape[0]
-                #print(loss2)
-
-                #for grid_size in range(1000, 50000, 1000):
-                    #self.grid_size = grid_size
-                    #print("for grid_size", self.grid_size)
-                    #if not hasattr(self, "phi_grid"):
-                        #self.y_grid = np.linspace(0, 1, self.grid_size,
-                                             #dtype=np.float32)
-                        #self.phi_grid = np.array(fourierseries(self.y_grid,
-                                                 #self.ncomponents).T)
-                        #self.phi_grid = _np_to_var(self.phi_grid)
-                        #if self.gpu:
-                            #self.phi_grid = self.phi_grid.cuda()
-
-                    #loss2 = (Variable.mm(output, self.phi_grid).sum(1)**2)
-                    #loss2 = loss2.mean()
-                    #del(self.phi_grid)
-                    #print(loss2)
-
-                self._create_phi_grid()
-
-                loss2 = Variable.mm(output, self.phi_grid)**2
+                loss2 = output_grid / normalizing[:,None]
+                loss2 = loss2 ** 2
                 loss2 = loss2.mean()
 
                 loss = loss1 + loss2
+
                 loss_vals.append(loss.data.cpu().numpy()[0])
                 batch_sizes.append(inputv_this.shape[0])
 
@@ -490,7 +501,7 @@ class NNCDE(BaseEstimator):
 
                 next_input_l_size = x_dim
                 output_hl_size = int(ncomponents * hls_multiplier)
-                self.m = nn.AlphaDropout(p=0.5)
+                self.m = nn.Dropout(p=0.5)
 
                 for i in range(nhlayers):
                     lname = "fc_" + str(i)
@@ -528,8 +539,9 @@ class NNCDE(BaseEstimator):
                     fc = self.__getattr__("fc_" + str(i))
                     fcn = self.__getattr__("fc_n_" + str(i))
                     x = fcn(F.relu(fc(x)))
-                    #x = (F.relu(fc(x)))
-                    self.m(x)
+                    #x = F.selu(fc(x))
+                    #x = F.relu(fc(x))
+                    x = self.m(x)
                 x = self.fc_last(x)
                 x = F.sigmoid(x / 10) * 2 * self.np_sqrt2 - self.np_sqrt2
                 #x = self._decay_x(x)
