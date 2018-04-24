@@ -43,12 +43,12 @@ class NNCDE(BaseEstimator):
         Maximum number of components of the Fourier series
         expansion.
 
-    beta_loss_penal_exp : integer
+    beta_loss_penal_exp : float
         Exponential term for penalizaing the size of beta's of the Fourier Series. This penalization occurs for training only (does not affect score method nor validation set if es=True).
-    beta_loss_penal_base : integer
+    beta_loss_penal_base : float
         Base term for penalizaing the size of beta's of the Fourier Series. This penalization occurs for training only (does not affect score method nor validation set if es=True).
-    nn_weights_loss_penal : integer
-        Mulplier for penalizaing the size of neural network weights. This penalization occurs for training only (does not affect score method nor validation set if es=True).
+    nn_weight_decay : object
+        Mulplier for penalizaing the size of neural network weights. This penalization occurs for training only (does not affect score method nor validation of early stopping).
 
     nhlayers : integer
         Number of hidden layers for the neural network. If set to 0, then it degenerates to linear regression.
@@ -57,8 +57,9 @@ class NNCDE(BaseEstimator):
 
     es : bool
         If true, then will split the training set into training and validation and calculate the validation internally on each epoch and check if the validation loss increases or not.
-    es_validation_set : float
-        Size of the validation set if es == True.
+    es_validation_set_size : float, int
+        Size of the validation set if es == True, given as proportion of train set or as absolute number. If None, then `round(min(x_train.shape[0] * 0.10, 5000))` will be used.
+n_train = x_train.shape[0] - n_test
     es_give_up_after_nepochs : float
         Amount of epochs to try to decrease the validation loss before giving up and stoping training.
     es_splitter_random_state : float
@@ -88,15 +89,15 @@ class NNCDE(BaseEstimator):
         Level verbosity. Set to 0 for silent mode.
     """
     def __init__(self,
-                 ncomponents=50,
+                 ncomponents=30,
                  beta_loss_penal_exp=0,
                  beta_loss_penal_base=0,
-                 nn_weights_loss_penal=0,
-                 nhlayers=1,
-                 hls_multiplier=5,
+                 nn_weight_decay=0,
+                 nhlayers=10,
+                 hls_multiplier=50,
 
                  es = True,
-                 es_validation_set = 0.1,
+                 es_validation_set_size = None,
                  es_give_up_after_nepochs = 50,
                  es_splitter_random_state = 0,
 
@@ -104,10 +105,10 @@ class NNCDE(BaseEstimator):
 
                  batch_initial=20,
                  batch_step_multiplier=1.1,
-                 batch_step_epoch_expon=1.1,
-                 batch_max_size=600,
+                 batch_step_epoch_expon=1.3,
+                 batch_max_size=500,
 
-                 grid_size=20000,
+                 grid_size=100000,
                  batch_test_size=2000,
                  gpu=True,
                  verbose=1,
@@ -172,7 +173,7 @@ class NNCDE(BaseEstimator):
 
         assert(self.beta_loss_penal_exp >= 0)
         assert(self.beta_loss_penal_base >= 0)
-        assert(self.nn_weights_loss_penal >= 0)
+        assert(self.nn_weight_decay >= 0)
 
         assert(self.nhlayers >= 0)
         assert(self.hls_multiplier > 0)
@@ -183,8 +184,12 @@ class NNCDE(BaseEstimator):
 
         range_epoch = range(nepoch)
         if self.es:
+            es_validation_set_size = self.es_validation_set_size
+            if es_validation_set_size is None:
+                es_validation_set_size = round(
+                    min(x_train.shape[0] * 0.10, 5000))
             splitter = ShuffleSplit(n_splits=1,
-                test_size=self.es_validation_set,
+                test_size=es_validation_set_size,
                 random_state=self.es_splitter_random_state)
             index_train, index_val = next(iter(splitter.split(x_train,
                 y_train)))
@@ -210,8 +215,8 @@ class NNCDE(BaseEstimator):
 
         start_time = time.process_time()
 
-        optimizer = optim.Adamax(self.neural_net.parameters(),
-                                 lr=0.004)
+        optimizer = optim.Adamax(self.neural_net.parameters(), lr=0.008,
+                                 weight_decay=self.nn_weight_decay)
         es_penal_tries = 0
         for _ in range_epoch:
             batch_size = int(min(batch_max_size,
@@ -250,18 +255,6 @@ class NNCDE(BaseEstimator):
                     optimizer.param_groups[0]['lr'] *= 0.5
                     self.neural_net.load_state_dict(best_state_dict)
                 elif es_tries >= self.es_give_up_after_nepochs:
-                    """
-                    if es_penal_tries <= 20:
-                        self.nn_weights_loss_penal += 0.05
-                        es_penal_tries += 1
-                        es_tries = 0
-                        if self.verbose >= 1:
-                            print("Validation loss did not improve after",
-                                  self.es_give_up_after_nepochs, "tries.",
-                                  "Increasing weight penalty")
-
-                    else:
-                    """
                     self.neural_net.load_state_dict(best_state_dict)
                     if self.verbose >= 1:
                         print("Validation loss did not improve after",
@@ -270,9 +263,6 @@ class NNCDE(BaseEstimator):
                     break
 
             self.epoch_count += 1
-            #optimizer.param_groups[0]['weight_decay'] *= 0.9
-            #if self.epoch_count >= 200:
-            #    optimizer.param_groups[0]['weight_decay'] = 0
 
         elapsed_time = time.process_time() - start_time
         if self.verbose >= 1:
@@ -345,13 +335,6 @@ class NNCDE(BaseEstimator):
                     penal = penal.mean()
                     penal = penal * self.beta_loss_penal_base
                     loss += penal
-
-                # Penalize on nn weights
-                if self.nn_weights_loss_penal != 0 and ftype == "train":
-                    penal = self.neural_net.parameters()
-                    penal = map(lambda x: (x**2).sum(), penal)
-                    penal = Variable.cat(tuple(penal)).sum()
-                    loss += penal * self.nn_weights_loss_penal
 
                 # Correction for last batch as it might be smaller
                 if batch_actual_size != batch_size:
@@ -430,6 +413,7 @@ class NNCDE(BaseEstimator):
                 loss1 = loss1.mean()
 
                 loss2 = output_grid / normalizing[:,None]
+                del(normalizing)
                 loss2 = loss2 ** 2
                 loss2 = loss2.mean()
 
@@ -486,7 +470,7 @@ class NNCDE(BaseEstimator):
     def _create_phi_grid(self):
         if not hasattr(self, "phi_grid"):
             self.y_grid = np.linspace(0, 1, self.grid_size,
-                                      dtype=np.float32)
+                                      dtype=np.float32)[1:-1]
             self.phi_grid = np.array(fourierseries(self.y_grid,
                                      self.ncomponents).T)
             self.phi_grid = _np_to_var(self.phi_grid)
@@ -538,12 +522,12 @@ class NNCDE(BaseEstimator):
                 for i in range(self.nhlayers):
                     fc = self.__getattr__("fc_" + str(i))
                     fcn = self.__getattr__("fc_n_" + str(i))
-                    x = fcn(F.relu(fc(x)))
+                    x = fcn(F.elu(fc(x)))
                     #x = F.selu(fc(x))
                     #x = F.relu(fc(x))
                     x = self.m(x)
                 x = self.fc_last(x)
-                x = F.sigmoid(x / 10) * 2 * self.np_sqrt2 - self.np_sqrt2
+                x = F.sigmoid(x) * 2 * self.np_sqrt2 - self.np_sqrt2
                 #x = self._decay_x(x)
                 return x
 
