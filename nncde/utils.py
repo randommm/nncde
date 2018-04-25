@@ -81,7 +81,7 @@ def set_cache_dir(cachedir, bytes_limit=10*2**30):
     fsc_cached = cache(fourierseries._base_fourier_component)
     fourierseries._fourier_component = fsc_cached
 
-def _np_to_var(arr, volatile=False):
+def _np_to_tensor(arr):
     arr = np.array(arr, dtype='f4')
-    arr = Variable(torch.from_numpy(arr), volatile=volatile)
+    arr = torch.from_numpy(arr)
     return arr

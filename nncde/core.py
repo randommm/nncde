@@ -16,7 +16,6 @@
 from __future__ import division
 
 import torch
-from torch.autograd import Variable
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
@@ -27,7 +26,7 @@ import itertools
 from sklearn.base import BaseEstimator
 from sklearn.model_selection import ShuffleSplit
 
-from .utils import fourierseries, _np_to_var, cache_data
+from .utils import fourierseries, _np_to_tensor, cache_data
 
 class NNCDE(BaseEstimator):
     """
@@ -105,7 +104,7 @@ n_train = x_train.shape[0] - n_test
 
                  batch_initial=20,
                  batch_step_multiplier=1.1,
-                 batch_step_epoch_expon=1.3,
+                 batch_step_epoch_expon=1.1,
                  batch_max_size=500,
 
                  grid_size=100000,
@@ -193,6 +192,8 @@ n_train = x_train.shape[0] - n_test
                 random_state=self.es_splitter_random_state)
             index_train, index_val = next(iter(splitter.split(x_train,
                 y_train)))
+            self.index_train = index_train
+            self.index_val = index_val
 
             inputv_val = inputv_train[index_val]
             target_val = target_train[index_val]
@@ -210,12 +211,14 @@ n_train = x_train.shape[0] - n_test
 
             batch_test_size = min(self.batch_test_size,
                                   inputv_val.shape[0])
+            self.loss_history_validation = []
 
         batch_max_size = min(self.batch_max_size, inputv_train.shape[0])
+        self.loss_history_train = []
 
         start_time = time.process_time()
 
-        optimizer = optim.Adamax(self.neural_net.parameters(), lr=0.008,
+        optimizer = optim.Adamax(self.neural_net.parameters(), lr=0.004,
                                  weight_decay=self.nn_weight_decay)
         es_penal_tries = 0
         for _ in range_epoch:
@@ -231,13 +234,32 @@ n_train = x_train.shape[0] - n_test
             target_train = np.ascontiguousarray(target_train)
 
             self.neural_net.train()
-            self._one_epoch("train", batch_size, inputv_train,
-                target_train, optimizer, criterion, volatile=False)
+            try:
+                self._one_epoch("train", batch_size, batch_test_size,
+                                inputv_train, target_train, optimizer,
+                                criterion, volatile=False)
+            except RuntimeError as err:
+                if self.epoch_count == 0:
+                    raise err
+                if self.verbose >= 2:
+                    print("Runtime error problem probably due to",
+                           "learning rate.")
+                    print("Decreasing learning rate by half.")
+                optimizer.param_groups[0]['lr'] *= 0.5
+                self.neural_net.load_state_dict(best_state_dict)
+
+            self.neural_net.eval()
+            avloss = self._one_epoch("train", batch_size,
+                          batch_test_size, inputv_train, target_train,
+                          optimizer, criterion, volatile=True)
+            self.loss_history_train.append(avloss)
+
             if self.es:
                 self.neural_net.eval()
-                avloss = self._one_epoch("test", batch_test_size,
-                    inputv_val, target_val, optimizer, criterion,
-                    volatile=True)
+                avloss = self._one_epoch("val", batch_size,
+                    batch_test_size, inputv_val, target_val, optimizer,
+                    criterion, volatile=True)
+                self.loss_history_validation.append(avloss)
                 if avloss <= self.best_loss_val:
                     self.best_loss_val = avloss
                     best_state_dict = self.neural_net.state_dict()
@@ -270,195 +292,190 @@ n_train = x_train.shape[0] - n_test
 
         return self
 
-    def _one_epoch(self, ftype, batch_size, inputv, target, optimizer,
-                   criterion, volatile):
+    def _one_epoch(self, ftype, batch_train_size, batch_test_size,
+                   inputv, target, optimizer, criterion, volatile):
+        with torch.set_grad_enabled(not volatile):
+            if volatile:
+                batch_size = batch_test_size
+            else:
+                batch_size = batch_train_size
 
-        inputv = torch.from_numpy(inputv)
-        target = torch.from_numpy(target)
-        if self.gpu:
-            inputv = inputv.pin_memory()
-            target = target.pin_memory()
-        inputv = Variable(inputv, volatile=volatile)
-        target = Variable(target, volatile=volatile)
+            if ftype == "train":
+                batch_show_size = batch_train_size
+            else:
+                batch_show_size = batch_test_size
 
-        loss_vals = []
-        batch_sizes = []
-        for i in range(0, target.shape[0] + batch_size, batch_size):
-            if i < target.shape[0]:
-                inputv_next = inputv[i:i+batch_size]
-                target_next = target[i:i+batch_size]
+            inputv = torch.from_numpy(inputv)
+            target = torch.from_numpy(target)
+            if self.gpu:
+                inputv = inputv.pin_memory()
+                target = target.pin_memory()
 
-                if self.gpu:
-                    inputv_next = inputv_next.cuda(async=True)
-                    target_next = target_next.cuda(async=True)
+            loss_vals = []
+            batch_sizes = []
+            for i in range(0, target.shape[0] + batch_size, batch_size):
+                if i < target.shape[0]:
+                    inputv_next = inputv[i:i+batch_size]
+                    target_next = target[i:i+batch_size]
 
-            if i != 0:
-                batch_actual_size = inputv_this.shape[0]
-                if batch_actual_size != batch_size and ftype == "train":
-                    continue
+                    if self.gpu:
+                        inputv_next = inputv_next.cuda(async=True)
+                        target_next = target_next.cuda(async=True)
 
-                optimizer.zero_grad()
-                output = self.neural_net(inputv_this)
+                if i != 0:
+                    batch_actual_size = inputv_this.shape[0]
+                    if batch_actual_size != batch_size and not volatile:
+                        continue
 
-                self._create_phi_grid()
-                output_grid = Variable.mm(output, self.phi_grid)
-                output_grid = F.softplus(output_grid)
+                    optimizer.zero_grad()
+                    output = self.neural_net(inputv_this)
 
-                normalizing = output_grid.mean(1)
+                    self._create_phi_grid()
+                    output_grid = torch.mm(output, self.phi_grid)
+                    output_grid = F.softplus(output_grid)
 
-                loss1 = F.softplus((output * target_this).sum(1))
-                loss1 = -2 * loss1 / normalizing
-                loss1 = loss1.mean()
+                    normalizing = output_grid.mean(1)
 
-                loss2 = output_grid / normalizing[:,None]
-                loss2 = loss2 ** 2
-                loss2 = loss2.mean()
+                    loss1 = F.softplus((output * target_this).sum(1))
+                    loss1 = -2 * loss1 / normalizing
+                    loss1 = loss1.mean()
 
-                loss = loss1 + loss2
+                    loss2 = output_grid / normalizing[:,None]
+                    loss2 = loss2 ** 2
+                    loss2 = loss2.mean()
 
-                #alpha = min(0.1 * (self.epoch_count + 1) ** 2, 100)
-                #loss = (output * target_this).sum(1) + 1
-                #loss = F.softplus(loss, alpha)
-                #loss = Variable.clamp(loss, 1e-30)
-                #loss = - loss.log().mean()
+                    loss = loss1 + loss2
 
-                # Penalize on betas
-                if self.beta_loss_penal_base != 0 and ftype == "train":
-                    penal = output ** 2
-                    if self.beta_loss_penal_exp != 0:
-                        aranged = Variable(
-                            loss.data.new(
-                                range(1, self.ncomponents + 1))
-                            ** self.beta_loss_penal_exp
-                            )
-                        penal = penal * aranged
-                    penal = penal.mean()
-                    penal = penal * self.beta_loss_penal_base
-                    loss += penal
+                    #alpha = min(0.1 * (self.epoch_count + 1) ** 2, 100)
+                    #loss = (output * target_this).sum(1) + 1
+                    #loss = F.softplus(loss, alpha)
+                    #loss = torch.clamp(loss, 1e-30)
+                    #loss = - loss.log().mean()
 
-                # Correction for last batch as it might be smaller
-                if batch_actual_size != batch_size:
-                    loss *= batch_actual_size / batch_size
+                    # Penalize on betas
+                    if self.beta_loss_penal_base != 0 and not volatile:
+                        penal = output ** 2
+                        if self.beta_loss_penal_exp != 0:
+                            aranged = (loss.data.new(
+                                    range(1, self.ncomponents + 1))
+                                ** self.beta_loss_penal_exp
+                                )
+                            penal = penal * aranged
+                        penal = penal.mean()
+                        penal = penal * self.beta_loss_penal_base
+                        loss += penal
 
-                np_loss = loss.data.cpu().numpy()[0]
-                if np.isnan(np_loss):
-                    raise RuntimeError("Loss is NaN")
+                    # Correction for last batch as it might be smaller
+                    #if batch_actual_size != batch_size:
+                    #    loss *= batch_actual_size / batch_size
 
-                loss_vals.append(np_loss)
-                batch_sizes.append(batch_actual_size)
+                    np_loss = loss.data.cpu().numpy()
+                    if np.isnan(np_loss):
+                        raise RuntimeError("Loss is NaN")
 
-                if ftype == "train":
-                    loss.backward()
-                    optimizer.step()
+                    loss_vals.append(np_loss)
+                    batch_sizes.append(batch_actual_size)
 
-            inputv_this = inputv_next
-            target_this = target_next
+                    if not volatile:
+                        loss.backward()
+                        optimizer.step()
 
-        avgloss = np.average(loss_vals, weights=batch_sizes)
-        if self.verbose >= 2:
-            print("Finished epoch", self.epoch_count,
-                  "with batch size", batch_size,
-                  "and", ftype,
-                  ("pseudo-" if ftype == "train" else "") + "loss",
-                  avgloss, flush=True)
+                inputv_this = inputv_next
+                target_this = target_next
 
-        return avgloss
+            avgloss = np.average(loss_vals, weights=batch_sizes)
+            if self.verbose >= 2 and volatile:
+                print("Finished epoch", self.epoch_count,
+                      "with batch size", batch_show_size,
+                      "and", ftype + " loss",
+                      avgloss, flush=True)
+
+            return avgloss
 
     def score(self, x_test, y_test):
-        self.neural_net.eval()
-        inputv = _np_to_var(x_test, volatile=True)
-        target = _np_to_var(fourierseries(y_test, self.ncomponents),
-                            volatile=True)
+        with torch.no_grad:
+            self.neural_net.eval()
+            inputv = _np_to_tensor(x_test)
+            target = _np_to_tensor(fourierseries(y_test, self.ncomponents))
 
-        if self.gpu:
-            inputv = Variable(inputv.data.pin_memory(), volatile=True)
-            target = Variable(target.data.pin_memory(), volatile=True)
+            if self.gpu:
+                inputv = inputv.pin_memory()
+                target = target.pin_memory()
 
-        batch_size = min(self.batch_test_size, x_test.shape[0])
+            batch_size = min(self.batch_test_size, x_test.shape[0])
 
-        loss_vals = []
-        batch_sizes = []
-        for i in range(0, target.shape[0] + batch_size, batch_size):
-            if i < target.shape[0]:
-                inputv_next = inputv[i:i+batch_size]
-                target_next = target[i:i+batch_size]
+            loss_vals = []
+            batch_sizes = []
+            for i in range(0, target.shape[0] + batch_size, batch_size):
+                if i < target.shape[0]:
+                    inputv_next = inputv[i:i+batch_size]
+                    target_next = target[i:i+batch_size]
 
-                if self.gpu:
-                    inputv_next = inputv_next.cuda(async=True)
-                    target_next = target_next.cuda(async=True)
+                    if self.gpu:
+                        inputv_next = inputv_next.cuda(async=True)
+                        target_next = target_next.cuda(async=True)
 
-            if i != 0:
-                #output = self.neural_net(inputv_this)
+                if i != 0:
+                    output = self.neural_net(inputv_this)
 
-                #loss1 = -2 * (output * target_this).sum(1)
-                #loss1 = loss1.mean()
+                    self._create_phi_grid()
+                    output_grid = torch.mm(output, self.phi_grid)
+                    output_grid = F.softplus(output_grid)
 
-                #self._create_phi_grid()
+                    normalizing = output_grid.mean(1)
 
-                #loss2 = Variable.mm(output, self.phi_grid)**2
-                #loss2 = loss2.mean()
+                    loss1 = F.softplus((output * target_this).sum(1))
+                    loss1 = -2 * loss1 / normalizing
+                    loss1 = loss1.mean()
 
-                #loss = loss1 + loss2
-                #----------
-                output = self.neural_net(inputv_this)
+                    loss2 = output_grid / normalizing[:,None]
+                    del(normalizing)
+                    loss2 = loss2 ** 2
+                    loss2 = loss2.mean()
 
-                self._create_phi_grid()
-                output_grid = Variable.mm(output, self.phi_grid)
-                output_grid = F.softplus(output_grid)
+                    loss = loss1 + loss2
 
-                normalizing = output_grid.mean(1)
+                    loss_vals.append(loss.data.cpu().numpy())
+                    batch_sizes.append(inputv_this.shape[0])
 
-                loss1 = F.softplus((output * target_this).sum(1))
-                loss1 = -2 * loss1 / normalizing
-                loss1 = loss1.mean()
+                inputv_this = inputv_next
+                target_this = target_next
 
-                loss2 = output_grid / normalizing[:,None]
-                del(normalizing)
-                loss2 = loss2 ** 2
-                loss2 = loss2.mean()
-
-                loss = loss1 + loss2
-
-                loss_vals.append(loss.data.cpu().numpy()[0])
-                batch_sizes.append(inputv_this.shape[0])
-
-            inputv_this = inputv_next
-            target_this = target_next
-
-        return -1 * np.average(loss_vals, weights=batch_sizes)
+            return -1 * np.average(loss_vals, weights=batch_sizes)
 
     def predict(self, x_pred):
-        self.neural_net.eval()
-        inputv = _np_to_var(x_pred, volatile=True)
-        self._create_phi_grid()
-        target = self.phi_grid
+        with torch.no_grad:
+            self.neural_net.eval()
+            inputv = _np_to_tensor(x_pred)
+            self._create_phi_grid()
+            target = self.phi_grid
 
-        if self.gpu:
-            inputv = inputv.cuda()
-            target = target.cuda()
+            if self.gpu:
+                inputv = inputv.cuda()
+                target = target.cuda()
 
-        #Normalize by min
-        #x_output_pred = self.neural_net(inputv)
-        #output_pred = Variable.mm(x_output_pred, target)
-        #output_pred += 1
+            #Normalize by min
+            #x_output_pred = self.neural_net(inputv)
+            #output_pred = torch.mm(x_output_pred, target)
+            #output_pred += 1
 
-        #output_pred = output_pred.data.cpu().numpy()
+            #output_pred = output_pred.data.cpu().numpy()
 
-        #normalizer = np.min(output_pred, 1)
-        #normalizer = torch.from_numpy(normalizer)
-        #normalizer = torch.clamp(normalizer, max=0)
-        #normalizer = normalizer.numpy()
+            #normalizer = np.min(output_pred, 1)
+            #normalizer = torch.from_numpy(normalizer)
+            #normalizer = torch.clamp(normalizer, max=0)
+            #normalizer = normalizer.numpy()
 
-        #output_pred = output_pred - normalizer[:, None]
-        #output_pred /= output_pred.mean(1)[:, None]
-        #return output_pred
+            #output_pred = output_pred - normalizer[:, None]
+            #output_pred /= output_pred.mean(1)[:, None]
+            #return output_pred
 
-        x_output_pred = self.neural_net(inputv)
-        output_pred = Variable.mm(x_output_pred, target)
+            x_output_pred = self.neural_net(inputv)
+            output_pred = torch.mm(x_output_pred, target)
 
-        output_pred = F.softplus(output_pred)
-        output_pred /= output_pred.mean(1)[:,None]
-        return output_pred.data.cpu().numpy()
+            output_pred = F.softplus(output_pred)
+            output_pred /= output_pred.mean(1)[:,None]
+            return output_pred.data.cpu().numpy()
 
     def change_grid_size(self, new_grid_size):
         self.grid_size = new_grid_size
@@ -473,7 +490,7 @@ n_train = x_train.shape[0] - n_test
                                       dtype=np.float32)[1:-1]
             self.phi_grid = np.array(fourierseries(self.y_grid,
                                      self.ncomponents).T)
-            self.phi_grid = _np_to_var(self.phi_grid)
+            self.phi_grid = _np_to_tensor(self.phi_grid)
             if self.gpu:
                 self.phi_grid = self.phi_grid.cuda()
 
@@ -483,19 +500,56 @@ n_train = x_train.shape[0] - n_test
                          hls_multiplier):
                 super(NeuralNet, self).__init__()
 
-                next_input_l_size = x_dim
-                output_hl_size = int(ncomponents * hls_multiplier)
-                self.m = nn.Dropout(p=0.5)
 
-                for i in range(nhlayers):
-                    lname = "fc_" + str(i)
-                    lnname = "fc_n_" + str(i)
-                    self.__setattr__(lname,
-                        nn.Linear(next_input_l_size, output_hl_size))
-                    self.__setattr__(lnname,
-                        nn.BatchNorm1d(output_hl_size))
+                output_hl_size = int(ncomponents * hls_multiplier)
+                self.dropl = nn.Dropout(p=0.5)
+                next_input_l_size = x_dim
+
+                next_input_l_size = 1
+                self.nclayers = 4
+                clayers = []
+                polayers = []
+                normclayers = []
+                for i in range(self.nclayers):
+                    if next_input_l_size == 1:
+                        output_hl_size = 16
+                    else:
+                        output_hl_size = 32
+                    clayers.append(nn.Conv1d(next_input_l_size,
+                        output_hl_size, kernel_size=5, stride=2,
+                        padding=2))
+                    polayers.append(nn.MaxPool1d(stride=2,
+                        kernel_size=5, padding=2))
+                    normclayers.append(nn.BatchNorm1d(output_hl_size))
+                    self.add_module("cc_" + str(i), clayers[i])
+                    self.add_module("po_" + str(i), clayers[i])
+                    self.add_module("cc_n_" + str(i), normclayers[i])
+
                     next_input_l_size = output_hl_size
-                    self._initialize_layer(self.__getattr__(lname))
+                    self._initialize_layer(clayers[i])
+                self.clayers = clayers
+                self.polayers = polayers
+                self.normclayers = normclayers
+
+                faked = torch.randn(2, 1, x_dim)
+                for i in range(self.nclayers):
+                    faked = polayers[i](clayers[i](faked))
+                faked = faked.view(faked.size(0), -1)
+                next_input_l_size = faked.size(1)
+                del(faked)
+
+                llayers = []
+                normllayers = []
+                for i in range(nhlayers):
+                    llayers.append(nn.Linear(next_input_l_size,
+                                             output_hl_size))
+                    normllayers.append(nn.BatchNorm1d(output_hl_size))
+                    self.add_module("ll_" + str(i), llayers[i])
+                    self.add_module("ll_n_" + str(i), normllayers[i])
+                    next_input_l_size = output_hl_size
+                    self._initialize_layer(llayers[i])
+                self.llayers = llayers
+                self.normllayers = normllayers
 
                 self.fc_last = nn.Linear(next_input_l_size, ncomponents)
                 self._initialize_layer(self.fc_last)
@@ -507,34 +561,40 @@ n_train = x_train.shape[0] - n_test
                 self.np_sqrt2 = np.sqrt(2)
 
             def _decay_x(self, x):
-                exp_decay = - Variable.exp(self.exp_decay)
-                base_decay = Variable.exp(self.base_decay) + 1
+                exp_decay = - torch.exp(self.exp_decay)
+                base_decay = torch.exp(self.base_decay) + 1
 
-                decay = Variable(
-                    x.data.new(
-                        range(1, self.ncomponents + 1))
-                    ) * exp_decay
+                decay = (x.data.new(range(1, self.ncomponents + 1))
+                     * exp_decay)
                 decay = base_decay ** decay
 
                 return x * decay
 
             def forward(self, x):
-                for i in range(self.nhlayers):
-                    fc = self.__getattr__("fc_" + str(i))
-                    fcn = self.__getattr__("fc_n_" + str(i))
+
+                x = x[:, None]
+                for i in range(self.nclayers):
+                    fc = self.clayers[i]
+                    fpo = self.polayers[i]
+                    fcn = self.normclayers[i]
                     x = fcn(F.elu(fc(x)))
-                    #x = F.selu(fc(x))
-                    #x = F.relu(fc(x))
-                    x = self.m(x)
+                    x = fpo(x)
+                x = x.view(x.size(0), -1)
+
+                for i in range(self.nhlayers):
+                    fc = self.llayers[i]
+                    fcn = self.normllayers[i]
+                    x = fcn(F.elu(fc(x)))
+                    x = self.dropl(x)
                 x = self.fc_last(x)
                 x = F.sigmoid(x) * 2 * self.np_sqrt2 - self.np_sqrt2
                 #x = self._decay_x(x)
                 return x
 
             def _initialize_layer(self, layer):
-                nn.init.constant(layer.bias, 0)
-                gain=nn.init.calculate_gain('relu')
-                nn.init.xavier_normal(layer.weight, gain=gain)
+                nn.init.constant_(layer.bias, 0)
+                gain = nn.init.calculate_gain('relu')
+                nn.init.xavier_normal_(layer.weight, gain=gain)
 
         self.neural_net = NeuralNet(self.x_dim, self.ncomponents,
                                     self.nhlayers, self.hls_multiplier)
