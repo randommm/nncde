@@ -94,6 +94,7 @@ n_train = x_train.shape[0] - n_test
                  nn_weight_decay=0,
                  nhlayers=10,
                  hls_multiplier=50,
+                 convolutional=False,
 
                  es = True,
                  es_validation_set_size = None,
@@ -233,11 +234,49 @@ n_train = x_train.shape[0] - n_test
             inputv_train = np.ascontiguousarray(inputv_train)
             target_train = np.ascontiguousarray(target_train)
 
-            self.neural_net.train()
             try:
+                self.neural_net.train()
                 self._one_epoch("train", batch_size, batch_test_size,
                                 inputv_train, target_train, optimizer,
                                 criterion, volatile=False)
+
+                self.neural_net.eval()
+                avloss = self._one_epoch("train", batch_size,
+                              batch_test_size, inputv_train, target_train,
+                              optimizer, criterion, volatile=True)
+                self.loss_history_train.append(avloss)
+
+                if self.es:
+                    self.neural_net.eval()
+                    avloss = self._one_epoch("val", batch_size,
+                        batch_test_size, inputv_val, target_val, optimizer,
+                        criterion, volatile=True)
+                    self.loss_history_validation.append(avloss)
+                    if avloss <= self.best_loss_val:
+                        self.best_loss_val = avloss
+                        best_state_dict = self.neural_net.state_dict()
+                        es_tries = 0
+                        if self.verbose >= 2:
+                            print("This is the lowest validation loss",
+                                  "so far.")
+                    else:
+                        es_tries += 1
+
+                    if (es_tries == self.es_give_up_after_nepochs // 3 or
+                        es_tries == self.es_give_up_after_nepochs // 3 * 2):
+                        if self.verbose >= 2:
+                            print("Decreasing learning rate by half.")
+                        optimizer.param_groups[0]['lr'] *= 0.5
+                        self.neural_net.load_state_dict(best_state_dict)
+                    elif es_tries >= self.es_give_up_after_nepochs:
+                        self.neural_net.load_state_dict(best_state_dict)
+                        if self.verbose >= 1:
+                            print("Validation loss did not improve after",
+                                  self.es_give_up_after_nepochs, "tries.",
+                                  "Stopping")
+                        break
+
+                self.epoch_count += 1
             except RuntimeError as err:
                 if self.epoch_count == 0:
                     raise err
@@ -247,44 +286,14 @@ n_train = x_train.shape[0] - n_test
                     print("Decreasing learning rate by half.")
                 optimizer.param_groups[0]['lr'] *= 0.5
                 self.neural_net.load_state_dict(best_state_dict)
-
-            self.neural_net.eval()
-            avloss = self._one_epoch("train", batch_size,
-                          batch_test_size, inputv_train, target_train,
-                          optimizer, criterion, volatile=True)
-            self.loss_history_train.append(avloss)
-
-            if self.es:
-                self.neural_net.eval()
-                avloss = self._one_epoch("val", batch_size,
-                    batch_test_size, inputv_val, target_val, optimizer,
-                    criterion, volatile=True)
-                self.loss_history_validation.append(avloss)
-                if avloss <= self.best_loss_val:
-                    self.best_loss_val = avloss
-                    best_state_dict = self.neural_net.state_dict()
-                    es_tries = 0
-                    if self.verbose >= 2:
-                        print("This is the lowest validation loss",
-                              "so far.")
-                else:
-                    es_tries += 1
-
-                if (es_tries == self.es_give_up_after_nepochs // 3 or
-                    es_tries == self.es_give_up_after_nepochs // 3 * 2):
-                    if self.verbose >= 2:
-                        print("Decreasing learning rate by half.")
-                    optimizer.param_groups[0]['lr'] *= 0.5
+                continue
+            except KeyboardInterrupt:
+                if self.epoch_count > 0 and self.es:
+                    print("Keyboard interrupt detected.",
+                          "Switching weights to lowest validation loss",
+                          "and exiting")
                     self.neural_net.load_state_dict(best_state_dict)
-                elif es_tries >= self.es_give_up_after_nepochs:
-                    self.neural_net.load_state_dict(best_state_dict)
-                    if self.verbose >= 1:
-                        print("Validation loss did not improve after",
-                              self.es_give_up_after_nepochs, "tries.",
-                              "Stopping")
-                    break
-
-            self.epoch_count += 1
+                break
 
         elapsed_time = time.process_time() - start_time
         if self.verbose >= 1:
@@ -393,9 +402,9 @@ n_train = x_train.shape[0] - n_test
             return avgloss
 
     def score(self, x_test, y_test):
-        with torch.no_grad:
+        with torch.no_grad():
             self.neural_net.eval()
-            inputv = _np_to_tensor(x_test)
+            inputv = _np_to_tensor(np.ascontiguousarray(x_test))
             target = _np_to_tensor(fourierseries(y_test, self.ncomponents))
 
             if self.gpu:
@@ -444,7 +453,7 @@ n_train = x_train.shape[0] - n_test
             return -1 * np.average(loss_vals, weights=batch_sizes)
 
     def predict(self, x_pred):
-        with torch.no_grad:
+        with torch.no_grad():
             self.neural_net.eval()
             inputv = _np_to_tensor(x_pred)
             self._create_phi_grid()
@@ -497,46 +506,48 @@ n_train = x_train.shape[0] - n_test
     def _construct_neural_net(self):
         class NeuralNet(nn.Module):
             def __init__(self, x_dim, ncomponents, nhlayers,
-                         hls_multiplier):
+                         hls_multiplier, convolutional):
                 super(NeuralNet, self).__init__()
 
 
                 output_hl_size = int(ncomponents * hls_multiplier)
                 self.dropl = nn.Dropout(p=0.5)
+                self.convolutional = convolutional
                 next_input_l_size = x_dim
 
-                next_input_l_size = 1
-                self.nclayers = 4
-                clayers = []
-                polayers = []
-                normclayers = []
-                for i in range(self.nclayers):
-                    if next_input_l_size == 1:
-                        output_hl_size = 16
-                    else:
-                        output_hl_size = 32
-                    clayers.append(nn.Conv1d(next_input_l_size,
-                        output_hl_size, kernel_size=5, stride=2,
-                        padding=2))
-                    polayers.append(nn.MaxPool1d(stride=2,
-                        kernel_size=5, padding=2))
-                    normclayers.append(nn.BatchNorm1d(output_hl_size))
-                    self.add_module("cc_" + str(i), clayers[i])
-                    self.add_module("po_" + str(i), clayers[i])
-                    self.add_module("cc_n_" + str(i), normclayers[i])
+                if self.convolutional:
+                    next_input_l_size = 1
+                    self.nclayers = 4
+                    clayers = []
+                    polayers = []
+                    normclayers = []
+                    for i in range(self.nclayers):
+                        if next_input_l_size == 1:
+                            output_hl_size = 16
+                        else:
+                            output_hl_size = 32
+                        clayers.append(nn.Conv1d(next_input_l_size,
+                            output_hl_size, kernel_size=5, stride=1,
+                            padding=2))
+                        polayers.append(nn.MaxPool1d(stride=1,
+                            kernel_size=5, padding=2))
+                        normclayers.append(nn.BatchNorm1d(output_hl_size))
+                        self.add_module("cc_" + str(i), clayers[i])
+                        self.add_module("po_" + str(i), clayers[i])
+                        self.add_module("cc_n_" + str(i), normclayers[i])
 
-                    next_input_l_size = output_hl_size
-                    self._initialize_layer(clayers[i])
-                self.clayers = clayers
-                self.polayers = polayers
-                self.normclayers = normclayers
+                        next_input_l_size = output_hl_size
+                        self._initialize_layer(clayers[i])
+                    self.clayers = clayers
+                    self.polayers = polayers
+                    self.normclayers = normclayers
 
-                faked = torch.randn(2, 1, x_dim)
-                for i in range(self.nclayers):
-                    faked = polayers[i](clayers[i](faked))
-                faked = faked.view(faked.size(0), -1)
-                next_input_l_size = faked.size(1)
-                del(faked)
+                    faked = torch.randn(2, 1, x_dim)
+                    for i in range(self.nclayers):
+                        faked = polayers[i](clayers[i](faked))
+                    faked = faked.view(faked.size(0), -1)
+                    next_input_l_size = faked.size(1)
+                    del(faked)
 
                 llayers = []
                 normllayers = []
@@ -571,15 +582,15 @@ n_train = x_train.shape[0] - n_test
                 return x * decay
 
             def forward(self, x):
-
-                x = x[:, None]
-                for i in range(self.nclayers):
-                    fc = self.clayers[i]
-                    fpo = self.polayers[i]
-                    fcn = self.normclayers[i]
-                    x = fcn(F.elu(fc(x)))
-                    x = fpo(x)
-                x = x.view(x.size(0), -1)
+                if self.convolutional:
+                    x = x[:, None]
+                    for i in range(self.nclayers):
+                        fc = self.clayers[i]
+                        fpo = self.polayers[i]
+                        fcn = self.normclayers[i]
+                        x = fcn(F.elu(fc(x)))
+                        x = fpo(x)
+                    x = x.view(x.size(0), -1)
 
                 for i in range(self.nhlayers):
                     fc = self.llayers[i]
@@ -597,7 +608,8 @@ n_train = x_train.shape[0] - n_test
                 nn.init.xavier_normal_(layer.weight, gain=gain)
 
         self.neural_net = NeuralNet(self.x_dim, self.ncomponents,
-                                    self.nhlayers, self.hls_multiplier)
+                                    self.nhlayers, self.hls_multiplier,
+                                    self.convolutional)
 
     def __getstate__(self):
         d = self.__dict__.copy()
