@@ -242,15 +242,16 @@ n_train = x_train.shape[0] - n_test
 
                 self.neural_net.eval()
                 avloss = self._one_epoch("train", batch_size,
-                              batch_test_size, inputv_train, target_train,
-                              optimizer, criterion, volatile=True)
+                              batch_test_size, inputv_train,
+                              target_train, optimizer, criterion,
+                              volatile=True)
                 self.loss_history_train.append(avloss)
 
                 if self.es:
                     self.neural_net.eval()
                     avloss = self._one_epoch("val", batch_size,
-                        batch_test_size, inputv_val, target_val, optimizer,
-                        criterion, volatile=True)
+                        batch_test_size, inputv_val, target_val,
+                        optimizer, criterion, volatile=True)
                     self.loss_history_validation.append(avloss)
                     if avloss <= self.best_loss_val:
                         self.best_loss_val = avloss
@@ -262,8 +263,10 @@ n_train = x_train.shape[0] - n_test
                     else:
                         es_tries += 1
 
-                    if (es_tries == self.es_give_up_after_nepochs // 3 or
-                        es_tries == self.es_give_up_after_nepochs // 3 * 2):
+                    if (es_tries == self.es_give_up_after_nepochs // 3
+                        or
+                        es_tries == self.es_give_up_after_nepochs // 3
+                        * 2):
                         if self.verbose >= 2:
                             print("Decreasing learning rate by half.")
                         optimizer.param_groups[0]['lr'] *= 0.5
@@ -508,7 +511,6 @@ n_train = x_train.shape[0] - n_test
             def __init__(self, x_dim, ncomponents, nhlayers,
                          hls_multiplier, convolutional):
                 super(NeuralNet, self).__init__()
-
 
                 output_hl_size = int(ncomponents * hls_multiplier)
                 self.dropl = nn.Dropout(p=0.5)
