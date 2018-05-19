@@ -25,6 +25,7 @@ import time
 import itertools
 from sklearn.base import BaseEstimator
 from sklearn.model_selection import ShuffleSplit
+from copy import deepcopy
 
 from .utils import fourierseries, _np_to_tensor, cache_data
 
@@ -103,12 +104,12 @@ n_train = x_train.shape[0] - n_test
 
                  nepoch=200,
 
-                 batch_initial=20,
+                 batch_initial=200,
                  batch_step_multiplier=1.1,
-                 batch_step_epoch_expon=1.1,
-                 batch_max_size=500,
+                 batch_step_epoch_expon=1.4,
+                 batch_max_size=1000,
 
-                 grid_size=100000,
+                 grid_size=10000,
                  batch_test_size=2000,
                  gpu=True,
                  verbose=1,
@@ -219,7 +220,7 @@ n_train = x_train.shape[0] - n_test
 
         start_time = time.process_time()
 
-        optimizer = optim.Adamax(self.neural_net.parameters(), lr=0.004,
+        optimizer = optim.Adamax(self.neural_net.parameters(), lr=0.01,
                                  weight_decay=self.nn_weight_decay)
         es_penal_tries = 0
         for _ in range_epoch:
@@ -256,6 +257,7 @@ n_train = x_train.shape[0] - n_test
                     if avloss <= self.best_loss_val:
                         self.best_loss_val = avloss
                         best_state_dict = self.neural_net.state_dict()
+                        best_state_dict = deepcopy(best_state_dict)
                         es_tries = 0
                         if self.verbose >= 2:
                             print("This is the lowest validation loss",
@@ -600,7 +602,7 @@ n_train = x_train.shape[0] - n_test
                     x = fcn(F.elu(fc(x)))
                     x = self.dropl(x)
                 x = self.fc_last(x)
-                x = F.sigmoid(x) * 2 * self.np_sqrt2 - self.np_sqrt2
+                x = F.tanh(x) * self.np_sqrt2
                 #x = self._decay_x(x)
                 return x
 
