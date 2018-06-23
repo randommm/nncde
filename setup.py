@@ -30,7 +30,7 @@ setup(name='nncde',
       url='http://nncde.marcoinacio.com/',
       packages=['nncde'],
       keywords = ['neural networks', 'conditional density estimation',
-                  'fouerier series', 'nonparametric'],
+                  'fourier series', 'nonparametric'],
       license='GPL3',
       install_requires=['numpy', 'scikit-learn', 'torch']
      )
