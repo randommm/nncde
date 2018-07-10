@@ -109,7 +109,7 @@ n_train = x_train.shape[0] - n_test
                  batch_step_epoch_expon=1.4,
                  batch_max_size=1000,
 
-                 grid_size=10000,
+                 grid_size=1000,
                  batch_test_size=2000,
                  gpu=True,
                  verbose=1,
@@ -220,7 +220,7 @@ n_train = x_train.shape[0] - n_test
 
         start_time = time.process_time()
 
-        lr = 0.1
+        lr = 0.01
         optimizer = optim.Adamax(self.neural_net.parameters(), lr=lr,
                                  weight_decay=self.nn_weight_decay)
         es_penal_tries = 0
@@ -231,8 +231,8 @@ n_train = x_train.shape[0] - n_test
                 self.epoch_count ** self.batch_step_epoch_expon))
 
             permutation = np.random.permutation(target_train.shape[0])
-            inputv_train = torch.from_numpy(inputv_train[permutation])
-            target_train = torch.from_numpy(target_train[permutation])
+            inputv_train = inputv_train[permutation]
+            target_train = target_train[permutation]
             inputv_train = np.ascontiguousarray(inputv_train)
             target_train = np.ascontiguousarray(target_train)
 
@@ -308,14 +308,37 @@ n_train = x_train.shape[0] - n_test
                     self.neural_net.load_state_dict(best_state_dict)
                 break
 
+        self._find_cut_low_density(x_train, y_train)
+
         elapsed_time = time.process_time() - start_time
         if self.verbose >= 1:
             print("Elapsed time:", elapsed_time, flush=True)
 
         return self
 
+    def _find_cut_low_density(self, x_train, y_train, grid_size=30):
+        if self.verbose >= 2:
+            print("Looking for best cutpoint.")
+
+        scores = np.empty(grid_size)
+        cut_values = np.logspace(0, 4, grid_size)-1
+        for i, cut_value in enumerate(cut_values):
+            self.cut_low_density = cut_value
+            scores[i] = self.score(x_train, y_train)
+        self.cut_low_density = cut_values[np.argmax(scores)]
+
+        if self.verbose >= 2:
+            print("Best cutpoint is", self.cut_low_density)
+
+        return self
+
     def _one_epoch(self, ftype, batch_train_size, batch_test_size,
                    inputv, target, optimizer, criterion, volatile):
+        if volatile:
+            c_phi_grid = self.phi_grid
+        else:
+            self._create_random_phi_grid()
+            c_phi_grid = self.r_phi_grid
         with torch.set_grad_enabled(not volatile):
             if volatile:
                 batch_size = batch_test_size
@@ -353,7 +376,7 @@ n_train = x_train.shape[0] - n_test
                     output = self.neural_net(inputv_this)
 
                     self._create_phi_grid()
-                    output_grid = torch.mm(output, self.phi_grid)
+                    output_grid = torch.mm(output, c_phi_grid)
                     output_grid = F.softplus(output_grid)
 
                     normalizing = output_grid.mean(1)
@@ -406,6 +429,9 @@ n_train = x_train.shape[0] - n_test
                 target_this = target_next
 
             avgloss = np.average(loss_vals, weights=batch_sizes)
+            if self.verbose >= 2 and not volatile:
+                print("Finished training for epoch", self.epoch_count,
+                      "now calculating statistics.", flush=True)
             if self.verbose >= 2 and volatile:
                 print("Finished epoch", self.epoch_count,
                       "with batch size", batch_show_size,
@@ -447,11 +473,20 @@ n_train = x_train.shape[0] - n_test
                     normalizing = output_grid.mean(1)
 
                     loss1 = F.softplus((output * target_this).sum(1))
-                    loss1 = -2 * loss1 / normalizing
+                    loss1 = loss1 / normalizing
+
+                    indch = loss1 <= self.cut_low_density
+                    loss1[indch] = 0
+
+                    loss1 = -2 * loss1
                     loss1 = loss1.mean()
 
                     loss2 = output_grid / normalizing[:,None]
                     del(normalizing)
+
+                    indch = loss2 <= self.cut_low_density
+                    loss2[indch] = 0
+
                     loss2 = loss2 ** 2
                     loss2 = loss2.mean()
 
@@ -497,6 +532,10 @@ n_train = x_train.shape[0] - n_test
 
             output_pred = F.softplus(output_pred)
             output_pred /= output_pred.mean(1)[:,None]
+
+            indch = output_pred <= self.cut_low_density
+            output_pred[indch] = 0
+
             return output_pred.data.cpu().numpy()
 
     def change_grid_size(self, new_grid_size):
@@ -515,6 +554,17 @@ n_train = x_train.shape[0] - n_test
             self.phi_grid = _np_to_tensor(self.phi_grid)
             if self.gpu:
                 self.phi_grid = self.phi_grid.cuda()
+
+    def _create_random_phi_grid(self):
+        if not hasattr(self, "phi_grid"):
+            self.r_y_grid = np.linspace(0, 1, 102,
+                                        dtype=np.float32)[1:-1]
+            self.r_y_grid += np.random.uniform(-0.004, 0.004, 100)
+            self.r_phi_grid = np.array(fourierseries(self.r_y_grid,
+                                       self.ncomponents).T)
+            self.r_phi_grid = _np_to_tensor(self.r_phi_grid)
+            if self.gpu:
+                self.r_phi_grid = self.r_phi_grid.cuda()
 
     def _construct_neural_net(self):
         class NeuralNet(nn.Module):
@@ -659,6 +709,10 @@ n_train = x_train.shape[0] - n_test
         if "y_grid" in d.keys():
             del(self.y_grid)
             self._create_phi_grid()
+
+        #Backward compatibility
+        if "cut_low_density" in d.keys():
+            self.cut_low_density = 0
 
 class NNCDECached(NNCDE):
     def fit(self, x_train, y_train):
