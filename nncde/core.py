@@ -50,10 +50,10 @@ class NNCDE(BaseEstimator):
     nn_weight_decay : object
         Mulplier for penalizaing the size of neural network weights. This penalization occurs for training only (does not affect score method nor validation of early stopping).
 
-    nhlayers : integer
+    num_layers : integer
         Number of hidden layers for the neural network. If set to 0, then it degenerates to linear regression.
-    hls_multiplier : integer
-        Multiplier for the size of the hidden layers of the neural network. If set to 1, then each of them will have ncomponents components. If set to 2, then 2 * ncomponents components, and so on.
+    hidden_size : integer
+        Size of the hidden layers of the neural network.
 
     es : bool
         If true, then will split the training set into training and validation and calculate the validation internally on each epoch and check if the validation loss increases or not.
@@ -93,8 +93,8 @@ n_train = x_train.shape[0] - n_test
                  beta_loss_penal_exp=0,
                  beta_loss_penal_base=0,
                  nn_weight_decay=0,
-                 nhlayers=10,
-                 hls_multiplier=50,
+                 num_layers=10,
+                 hidden_size=1000,
                  convolutional=False,
 
                  es = True,
@@ -104,7 +104,7 @@ n_train = x_train.shape[0] - n_test
 
                  nepoch=200,
 
-                 batch_initial=200,
+                 batch_initial=50,
                  batch_step_multiplier=1.1,
                  batch_step_epoch_expon=1.4,
                  batch_max_size=1000,
@@ -124,7 +124,7 @@ n_train = x_train.shape[0] - n_test
 
         #if self.divide_batch_max_size_by_nlayers:
         #    self.batch_max_size_c = self.batch_max_size // (
-        #                                 self.nhlayers + 1)
+        #                                 self.num_layers + 1)
         #else:
         #    self.batch_max_size_c = self.batch_max_size
 
@@ -176,8 +176,8 @@ n_train = x_train.shape[0] - n_test
         assert(self.beta_loss_penal_base >= 0)
         assert(self.nn_weight_decay >= 0)
 
-        assert(self.nhlayers >= 0)
-        assert(self.hls_multiplier > 0)
+        assert(self.num_layers >= 0)
+        assert(self.hidden_size > 0)
 
         inputv_train = np.array(x_train, dtype='f4')
         target_train = np.array(fourierseries(y_train,
@@ -308,7 +308,8 @@ n_train = x_train.shape[0] - n_test
                     self.neural_net.load_state_dict(best_state_dict)
                 break
 
-        self._find_cut_low_density(x_train, y_train)
+        self._find_cut_low_density(x_train[index_val],
+                                   y_train[index_val])
 
         elapsed_time = time.process_time() - start_time
         if self.verbose >= 1:
@@ -316,7 +317,7 @@ n_train = x_train.shape[0] - n_test
 
         return self
 
-    def _find_cut_low_density(self, x_train, y_train, grid_size=30):
+    def _find_cut_low_density(self, x_train, y_train, grid_size=100):
         if self.verbose >= 2:
             print("Looking for best cutpoint.")
 
@@ -377,11 +378,12 @@ n_train = x_train.shape[0] - n_test
 
                     self._create_phi_grid()
                     output_grid = torch.mm(output, c_phi_grid)
-                    output_grid = F.softplus(output_grid)
+                    output_grid = F.softplus(output_grid + 1)
 
                     normalizing = output_grid.mean(1)
 
-                    loss1 = F.softplus((output * target_this).sum(1))
+                    loss1 = (output * target_this).sum(1)
+                    loss1 = F.softplus(loss1 + 1)
                     loss1 = -2 * loss1 / normalizing
                     loss1 = loss1.mean()
 
@@ -468,11 +470,12 @@ n_train = x_train.shape[0] - n_test
 
                     self._create_phi_grid()
                     output_grid = torch.mm(output, self.phi_grid)
-                    output_grid = F.softplus(output_grid)
+                    output_grid = F.softplus(output_grid + 1)
 
                     normalizing = output_grid.mean(1)
 
-                    loss1 = F.softplus((output * target_this).sum(1))
+                    loss1 = (output * target_this).sum(1)
+                    loss1 = F.softplus(loss1 + 1)
                     loss1 = loss1 / normalizing
 
                     indch = loss1 <= self.cut_low_density
@@ -530,7 +533,7 @@ n_train = x_train.shape[0] - n_test
             x_output_pred = self.neural_net(inputv)
             output_pred = torch.mm(x_output_pred, target)
 
-            output_pred = F.softplus(output_pred)
+            output_pred = F.softplus(output_pred + 1)
             output_pred /= output_pred.mean(1)[:,None]
 
             indch = output_pred <= self.cut_low_density
@@ -557,9 +560,9 @@ n_train = x_train.shape[0] - n_test
 
     def _create_random_phi_grid(self):
         if not hasattr(self, "phi_grid"):
-            self.r_y_grid = np.linspace(0, 1, 102,
+            self.r_y_grid = np.linspace(0, 1, 1002,
                                         dtype=np.float32)[1:-1]
-            self.r_y_grid += np.random.uniform(-0.004, 0.004, 100)
+            self.r_y_grid += np.random.uniform(-4.9e-5, 4.9e-5, 1)
             self.r_phi_grid = np.array(fourierseries(self.r_y_grid,
                                        self.ncomponents).T)
             self.r_phi_grid = _np_to_tensor(self.r_phi_grid)
@@ -568,11 +571,11 @@ n_train = x_train.shape[0] - n_test
 
     def _construct_neural_net(self):
         class NeuralNet(nn.Module):
-            def __init__(self, x_dim, ncomponents, nhlayers,
-                         hls_multiplier, convolutional):
+            def __init__(self, x_dim, ncomponents, num_layers,
+                         hidden_size, convolutional):
                 super(NeuralNet, self).__init__()
 
-                output_hl_size = int(ncomponents * hls_multiplier)
+                output_hl_size = int(hidden_size)
                 self.dropl = nn.Dropout(p=0.5)
                 self.convolutional = convolutional
                 next_input_l_size = x_dim
@@ -594,15 +597,11 @@ n_train = x_train.shape[0] - n_test
                         polayers.append(nn.MaxPool1d(stride=1,
                             kernel_size=5, padding=2))
                         normclayers.append(nn.BatchNorm1d(output_hl_size))
-                        self.add_module("cc_" + str(i), clayers[i])
-                        self.add_module("po_" + str(i), clayers[i])
-                        self.add_module("cc_n_" + str(i), normclayers[i])
-
                         next_input_l_size = output_hl_size
                         self._initialize_layer(clayers[i])
-                    self.clayers = clayers
-                    self.polayers = polayers
-                    self.normclayers = normclayers
+                    self.clayers = nn.ModuleList(clayers)
+                    self.polayers = nn.ModuleList(polayers)
+                    self.normclayers = nn.ModuleList(normclayers)
 
                     faked = torch.randn(2, 1, x_dim)
                     for i in range(self.nclayers):
@@ -613,23 +612,21 @@ n_train = x_train.shape[0] - n_test
 
                 llayers = []
                 normllayers = []
-                for i in range(nhlayers):
+                for i in range(num_layers):
                     llayers.append(nn.Linear(next_input_l_size,
                                              output_hl_size))
                     normllayers.append(nn.BatchNorm1d(output_hl_size))
-                    self.add_module("ll_" + str(i), llayers[i])
-                    self.add_module("ll_n_" + str(i), normllayers[i])
                     next_input_l_size = output_hl_size
                     self._initialize_layer(llayers[i])
-                self.llayers = llayers
-                self.normllayers = normllayers
+                self.llayers = nn.ModuleList(llayers)
+                self.normllayers = nn.ModuleList(normllayers)
 
                 self.fc_last = nn.Linear(next_input_l_size, ncomponents)
                 self._initialize_layer(self.fc_last)
                 self.exp_decay = nn.Parameter(torch.Tensor([0.0]))
                 self.base_decay = nn.Parameter(torch.Tensor([-5.0]))
 
-                self.nhlayers = nhlayers
+                self.num_layers = num_layers
                 self.ncomponents = ncomponents
                 self.np_sqrt2 = np.sqrt(2)
 
@@ -654,7 +651,7 @@ n_train = x_train.shape[0] - n_test
                         x = fpo(x)
                     x = x.view(x.size(0), -1)
 
-                for i in range(self.nhlayers):
+                for i in range(self.num_layers):
                     fc = self.llayers[i]
                     fcn = self.normllayers[i]
                     x = fcn(F.elu(fc(x)))
@@ -670,7 +667,7 @@ n_train = x_train.shape[0] - n_test
                 nn.init.xavier_normal_(layer.weight, gain=gain)
 
         self.neural_net = NeuralNet(self.x_dim, self.ncomponents,
-                                    self.nhlayers, self.hls_multiplier,
+                                    self.num_layers, self.hidden_size,
                                     self.convolutional)
 
     def __getstate__(self):
